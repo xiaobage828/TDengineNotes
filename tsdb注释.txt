@@ -1,0 +1,1779 @@
+
+
+-----------------------
+deps: 依赖的头文件和执行文件
+
+2022.12.10 - 2022.12.11 tsdb源码目录结构:
+balance: 平衡               mnode
+client: 客户端              client
+common: 共用的
+connector: 连接器           对应语言的client
+cq: stream                  client
+dnode: 物理结点             dnode
+inc: 共用的c语言头文件
+kit: 
+   shell: 脚本              cmd shell
+   taosdemo:
+   taosdump: dump data      dump.sh
+mnode: mnode模块            mnode
+os: 对不同系统做兼容
+plugins: 插件
+   http:
+   monitor:                 dnode
+   mqtt:
+query: 查询                 vnode
+rpc: rpc调用                dnode/client
+sync: 同步                  vnode
+tfs: 文件系统               dnode
+tsdb: database              vnode
+util: 工具
+vnode: vnode数据结点        vnode
+wal: write ahead log(预写式日志，checkpoint)        dnode/vnode
+
+
+
+
+
+
+----------------------------
+2022.11.03 下载taos源码
+尝试读了tsdb.h头文件
+
+
+
+
+----------------------------
+2022.11.04 - 2022.11.06 读demo.c文件
+demo.c
+
+main函数
+1. 获取连接TAOS:STscObj,  taos_connect() // taos连接数据
+2. 执行测试  Test()
+   2.1 执行sql：drop database if exists demo
+   2.2 执行sql: create database demo
+   2.3 执行sql: use demo
+   2.4 执行10遍sql: "insert into m1 values (%" PRId64 ", %d, %d, %d, %d, %f, %lf, '%s')", (uint64_t)(1546300800000 + i * 1000), i, i, i, i * 10000000, i * 1.0, i * 2.0, "hello"
+       2.4.1 拼接sql
+	   2.4.2 执行sql
+	   2.4.3 输出结果TAOS_RES:SSqlObj
+   2.5 执行sql: SELECT * FROM m1，返回TAOS_RES:SSqlObj
+   2.6 一行行打印结果
+3. 关闭连接  taos_close
+4. 清除资源  taos_cleanup
+
+
+----------------------------
+// 2022.11.06 读taos.h、tscSql.c、tsclient.h、tscSystem.c、 tansdef.h、tutil.h、 tscUtil.h文件
+
+taos.h
+
+
+tscSql.c
+
+
+tsclient.h
+typedef struct STscObj {
+  void *             signature;
+  void *             pTimer;
+  char               user[TSDB_USER_LEN];
+  char               pass[TSDB_PASS_LEN];
+  char               acctId[TSDB_ACCT_ID_LEN];
+  char               db[TSDB_ACCT_ID_LEN + TSDB_DB_NAME_LEN];
+  char               sversion[TSDB_VERSION_LEN];
+  char               clusterId[TSDB_CLUSTER_ID_LEN];
+  char               writeAuth : 1;
+  char               superAuth : 1;
+  uint32_t           connId;
+  uint64_t           rid;      // ref ID returned by taosAddRef
+  int64_t            hbrid;
+  struct SSqlObj *   sqlList;
+  struct SSqlStream *streamList;
+  SRpcObj           *pRpcObj;
+  SClusterInfo       *pClusterInfo;
+  SRpcCorEpSet      *tscCorMgmtEpSet;
+  pthread_mutex_t    mutex;
+  int32_t            numOfObj; // number of sqlObj from this tscObj
+      
+  SReqOrigin         from;
+} STscObj;
+
+
+
+typedef struct SSqlObj {
+  void            *signature;
+  int64_t          owner;        // owner of sql object, by which it is executed
+  STscObj         *pTscObj;
+  int64_t          rpcRid;
+  __async_cb_func_t  fp;
+  __async_cb_func_t  fetchFp;
+  void            *param;
+  _freeSqlSupporter  freeParam;
+  int64_t          stime;
+  uint32_t         queryId;
+  void *           pStream;
+  void *           pSubscription;
+  char *           sqlstr;
+  void *           pBuf;  // table meta buffer
+  char             parseRetry;
+  char             retry;
+  char             maxRetry;
+  SRpcEpSet        epSet;
+  char             listed;
+  tsem_t           rspSem;
+  SSqlCmd          cmd;
+  SSqlRes          res;
+
+  SSubqueryState   subState;
+  struct SSqlObj **pSubs;
+  struct SSqlObj  *rootObj;
+
+  int64_t          metaRid;
+  int64_t          svgroupRid;
+
+  int64_t          squeryLock;
+  int32_t          retryReason;  // previous error code
+  struct SSqlObj  *prev, *next;
+  int64_t          self;
+} SSqlObj;
+
+
+tscSystem.c
+
+
+tansdef.h
+#define TSDB_UNI_LEN              24
+#define TSDB_USER_LEN             TSDB_UNI_LEN
+
+
+----------------------------
+一、taos_connect
+----------------------------
+// 2022.11.06、2022.11.20 函数 taos_connect执行流程
+tscSql.c#*taos_connect:
+TAOS *taos_connect(const char *ip, const char *user, const char *pass, const char *db, uint16_t port) {
+  tscDebug("try to create a connection to %s:%u, user:%s db:%s", ip, port != 0 ? port : tsServerPort , user, db);
+  if (user == NULL) user = TSDB_DEFAULT_USER;
+  if (pass == NULL) pass = TSDB_DEFAULT_PASS;
+
+  return taos_connect_internal(ip, user, pass, NULL, db, port);
+}
+
+
+tscSql.c#*taos_connect:
+TAOS *taos_connect_internal(const char *ip, const char *user, const char *pass, const char *auth, const char *db,
+                            uint16_t port) {
+  STscObj *pObj = NULL;
+  SSqlObj *pSql = taosConnectImpl(ip, user, pass, auth, db, port, syncConnCallback, NULL, (void **)&pObj);
+  if (pSql != NULL) {
+    pSql->fp = syncConnCallback;
+    pSql->param = pSql;
+
+    tscBuildAndSendRequest(pSql, NULL);
+    tsem_wait(&pSql->rspSem);
+    if (0 == strlen(pSql->pTscObj->clusterId)) {
+      memcpy(pSql->pTscObj->clusterId, clusterDefaultId, strlen(clusterDefaultId));
+    } 
+    pSql->pTscObj->pClusterInfo = (SClusterInfo *)tscAcquireClusterInfo(pSql->pTscObj->clusterId);
+    if (pSql->res.code != TSDB_CODE_SUCCESS) {
+      terrno = pSql->res.code;
+      if (terrno ==TSDB_CODE_RPC_FQDN_ERROR) {
+        printf("taos connect failed, reason: %s\n\n", taos_errstr(pSql));
+      } else {
+        printf("taos connect failed, reason: %s.\n\n", tstrerror(terrno));
+      }
+      int32_t lastError = terrno;
+      taos_free_result(pSql);
+      if (terrno != lastError) terrno = lastError;
+      taos_close(pObj);
+      return NULL;
+    }
+    
+    tscDebug("%p DB connection is opening, rpcObj: %p, dnodeConn:%p", pObj, pObj->pRpcObj, pObj->pRpcObj->pDnodeConn);
+    taos_free_result(pSql);
+
+    return pObj;
+  }
+
+  printf("connect failed, reason: %s\n\n", taos_errstr(pSql));
+
+  return NULL;
+}
+
+tscSql.c#*taosConnectImpl: core
+static SSqlObj *taosConnectImpl(const char *ip, const char *user, const char *pass, const char *auth, const char *db,
+                         uint16_t port, void (*fp)(void *, TAOS_RES *, int), void *param, TAOS **taos) {
+  if (taos_init()) {
+    return NULL;
+  }
+
+  if (!validUserName(user)) {
+    terrno = TSDB_CODE_TSC_INVALID_USER_LENGTH;
+    return NULL;
+  }
+  SRpcCorEpSet corMgmtEpSet;
+
+  char secretEncrypt[32] = {0};
+  int  secretEncryptLen = 0;
+  if (auth == NULL) {
+    if (!validPassword(pass)) {
+      terrno = TSDB_CODE_TSC_INVALID_PASS_LENGTH;
+      return NULL;
+    }
+    taosEncryptPass((uint8_t *)pass, strlen(pass), secretEncrypt);
+  } else {
+    int   outlen = 0;
+    int   len = (int)strlen(auth);
+    char *base64 = (char *)base64_decode(auth, len, &outlen);
+    if (base64 == NULL || outlen == 0) {
+      tscError("invalid auth info:%s", auth);
+      free(base64);
+      terrno = TSDB_CODE_TSC_INVALID_PASS_LENGTH;
+      return NULL;
+    } else {
+      if (outlen >= TSDB_PASS_LEN) {
+        terrno = TSDB_CODE_TSC_INVALID_USER_LENGTH;
+        tscError("failed to connect DB, too long length of authentication: %s", base64);
+        return NULL;
+      }
+      memcpy(secretEncrypt, base64, outlen);
+      free(base64);
+    }
+    secretEncryptLen = outlen;
+  }
+  
+  if (ip) {
+    if (tscSetMgmtEpSetFromCfg(ip, NULL, &corMgmtEpSet) < 0) return NULL;
+    if (port) corMgmtEpSet.epSet.port[0] = port;
+  } else {
+    if (tscSetMgmtEpSetFromCfg(tsFirst, tsSecond, &corMgmtEpSet) < 0) return NULL;
+  }
+  char rpcKey[512] = {0};
+  snprintf(rpcKey, sizeof(rpcKey), "%s:%s:%s:%d", user, pass, ip, port);
+ 
+  void *pRpcObj = NULL;
+  if (tscAcquireRpc(rpcKey, user, secretEncrypt, &pRpcObj) != 0) {
+    terrno = TSDB_CODE_RPC_NETWORK_UNAVAIL;
+    return NULL;
+  }
+ 
+  STscObj *pObj = (STscObj *)calloc(1, sizeof(STscObj));
+  if (NULL == pObj) {
+    terrno = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    tscReleaseRpc(pRpcObj);
+    return NULL;
+  }
+
+  pObj->tscCorMgmtEpSet = malloc(sizeof(SRpcCorEpSet));
+  if (pObj->tscCorMgmtEpSet == NULL) {
+    terrno = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    tscReleaseRpc(pRpcObj);
+    free(pObj);
+    return NULL;
+  }
+  memcpy(pObj->tscCorMgmtEpSet, &corMgmtEpSet, sizeof(corMgmtEpSet));
+  
+  pObj->signature = pObj;
+  pObj->pRpcObj = (SRpcObj *)pRpcObj;
+  tstrncpy(pObj->user, user, sizeof(pObj->user));
+  secretEncryptLen = MIN(secretEncryptLen, sizeof(pObj->pass));
+  memcpy(pObj->pass, secretEncrypt, secretEncryptLen);
+
+  if (db) {
+    int32_t len = (int32_t)strlen(db);
+    /* db name is too long */
+    if (len >= TSDB_DB_NAME_LEN) {
+      terrno = TSDB_CODE_TSC_INVALID_DB_LENGTH;
+      tscReleaseRpc(pRpcObj);
+      free(pObj);
+      return NULL;
+    }
+
+    char tmp[TSDB_DB_NAME_LEN] = {0};
+    tstrncpy(tmp, db, sizeof(tmp));
+
+    stringProcess(tmp, (int32_t)strlen(tmp));
+    strtolower(pObj->db, tmp);
+  }
+
+  pthread_mutex_init(&pObj->mutex, NULL);
+
+  SSqlObj *pSql = (SSqlObj *)calloc(1, sizeof(SSqlObj));
+  if (NULL == pSql) {
+    terrno = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    tscReleaseRpc(pRpcObj);
+    free(pObj);
+    return NULL;
+  }
+
+  pSql->pTscObj   = pObj;
+  pSql->signature = pSql;
+  pSql->maxRetry  = TSDB_MAX_REPLICA;
+  pSql->fp        = fp;
+  pSql->param     = param;
+  pSql->cmd.command = TSDB_SQL_CONNECT;
+
+  tsem_init(&pSql->rspSem, 0, 0);
+
+  if (TSDB_CODE_SUCCESS != tscAllocPayload(&pSql->cmd, TSDB_DEFAULT_PAYLOAD_SIZE)) {
+    terrno = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    tscReleaseRpc(pRpcObj);
+    free(pSql);
+    free(pObj);
+    return NULL;
+  }
+
+  if (taos != NULL) {
+    *taos = pObj;
+  }
+  pObj->rid = taosAddRef(tscRefId, pObj);
+  registerSqlObj(pSql);
+
+  return pSql;
+}
+
+
+
+
+tutil.h#taosEncryptPass:
+static FORCE_INLINE void taosEncryptPass(uint8_t *inBuf, size_t inLen, char *target) {
+  T_MD5_CTX context;
+  tMD5Init(&context);
+  tMD5Update(&context, inBuf, (unsigned int)inLen);
+  tMD5Final(&context);
+  memcpy(target, context.digest, TSDB_KEY_LEN);
+}
+
+
+tscUtil.h#tscSetMgmtEpSetFromCfg:
+int tscSetMgmtEpSetFromCfg(const char *first, const char *second, SRpcCorEpSet *corMgmtEpSet) {
+  corMgmtEpSet->version = 0;
+  // init mgmt ip set
+  SRpcEpSet *mgmtEpSet = &(corMgmtEpSet->epSet);
+  mgmtEpSet->numOfEps = 0;
+  mgmtEpSet->inUse = 0;
+
+  if (first && first[0] != 0) {
+    if (strlen(first) >= TSDB_EP_LEN) {
+      terrno = TSDB_CODE_TSC_INVALID_FQDN;
+      return -1;
+    }
+    taosGetFqdnPortFromEp(first, mgmtEpSet->fqdn[mgmtEpSet->numOfEps], &(mgmtEpSet->port[mgmtEpSet->numOfEps]));
+    mgmtEpSet->numOfEps++;
+  }
+
+  if (second && second[0] != 0) {
+    if (strlen(second) >= TSDB_EP_LEN) {
+      terrno = TSDB_CODE_TSC_INVALID_FQDN;
+      return -1;
+    }
+    taosGetFqdnPortFromEp(second, mgmtEpSet->fqdn[mgmtEpSet->numOfEps], &(mgmtEpSet->port[mgmtEpSet->numOfEps]));
+    mgmtEpSet->numOfEps++;
+  }
+
+  if (mgmtEpSet->numOfEps == 0) {
+    terrno = TSDB_CODE_TSC_INVALID_FQDN;
+    return -1;
+  }
+
+  return 0;
+}
+
+
+
+tscdef.h:
+#define TSDB_UNI_LEN              24
+#define TSDB_USER_LEN             TSDB_UNI_LEN
+
+
+----------------------------
+二、taos_query 
+2022/11/20、2022/11/22  tscSql.c#taos_query
+----------------------------
+TAOS_RES* taos_query(TAOS *taos, const char *sqlstr) {
+  return taos_query_c(taos, sqlstr, (uint32_t)strlen(sqlstr), NULL);
+}
+
+
+
+TAOS_RES* taos_query_c(TAOS *taos, const char *sqlstr, uint32_t sqlLen, int64_t* res) {
+  STscObj *pObj = (STscObj *)taos;
+  if (pObj == NULL || pObj->signature != pObj) {
+    terrno = TSDB_CODE_TSC_DISCONNECTED;
+    return NULL;
+  }
+  
+  if (sqlLen > (uint32_t)tsMaxSQLStringLen) {
+    tscError("sql string exceeds max length:%d", tsMaxSQLStringLen);
+    terrno = TSDB_CODE_TSC_EXCEED_SQL_LIMIT;
+    return NULL;
+  }
+
+  nPrintTsc("%s", sqlstr);
+
+  SSqlObj* pSql = calloc(1, sizeof(SSqlObj));
+  if (pSql == NULL) {
+    tscError("failed to malloc sqlObj");
+    terrno = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    return NULL;
+  }
+  
+  tsem_init(&pSql->rspSem, 0, 0);
+  doAsyncQuery(pObj, pSql, waitForQueryRsp, taos, sqlstr, sqlLen);
+
+  if (res != NULL) {
+    atomic_store_64(res, pSql->self);
+  }
+
+  tsem_wait(&pSql->rspSem);
+  return pSql; 
+}
+
+tscAsync.c#doAsyncQuery
+void doAsyncQuery(STscObj* pObj, SSqlObj* pSql, __async_cb_func_t fp, void* param, const char* sqlstr, size_t sqlLen) {
+  SSqlCmd* pCmd = &pSql->cmd;
+
+  pSql->signature = pSql;
+  pSql->param     = param;
+  pSql->pTscObj   = pObj;
+  pSql->parseRetry= 0;
+  pSql->maxRetry  = TSDB_MAX_REPLICA;
+  pSql->fp        = fp;
+  pSql->fetchFp   = fp;
+  pSql->rootObj   = pSql;
+
+  registerSqlObj(pSql);
+
+  pSql->sqlstr = calloc(1, sqlLen + 1);
+  if (pSql->sqlstr == NULL) {
+    tscError("0x%"PRIx64" failed to malloc sql string buffer", pSql->self);
+    pSql->res.code = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    tscAsyncResultOnError(pSql);
+    return;
+  }
+
+  strntolower(pSql->sqlstr, sqlstr, (int32_t)sqlLen);
+
+  tscDebugL("0x%"PRIx64" SQL: %s", pSql->self, pSql->sqlstr);
+  pCmd->resColumnId = TSDB_RES_COL_ID;
+
+  taosAcquireRef(tscObjRef, pSql->self);
+
+  int32_t code = tsParseSql(pSql, true);
+
+  if (code == TSDB_CODE_TSC_ACTION_IN_PROGRESS) {
+    taosReleaseRef(tscObjRef, pSql->self);
+    return;
+  }
+  
+  if (code != TSDB_CODE_SUCCESS) {
+    pSql->res.code = code;
+    tscAsyncResultOnError(pSql);
+    taosReleaseRef(tscObjRef, pSql->self);
+    return;
+  }
+
+  SQueryInfo* pQueryInfo = tscGetQueryInfo(pCmd);
+  executeQuery(pSql, pQueryInfo);
+  taosReleaseRef(tscObjRef, pSql->self);
+}
+
+tscParseInsert.c#tsParseSql
+
+int tsParseSql(SSqlObj *pSql, bool initial) {
+  int32_t ret = TSDB_CODE_SUCCESS;
+  SSqlCmd* pCmd = &pSql->cmd;
+  if (!initial) {
+    tscDebug("0x%"PRIx64" resume to parse sql: %s", pSql->self, pCmd->insertParam.sql);
+  }
+
+  ret = tscAllocPayload(pCmd, TSDB_DEFAULT_PAYLOAD_SIZE);
+  if (TSDB_CODE_SUCCESS != ret) {
+    return ret;
+  }
+
+// 如果是insert
+  if (tscIsInsertData(pSql->sqlstr)) {
+    if (initial && ((ret = tsInsertInitialCheck(pSql)) != TSDB_CODE_SUCCESS)) {
+      strncpy(pCmd->payload, pCmd->insertParam.msg, TSDB_DEFAULT_PAYLOAD_SIZE);
+      return ret;
+    }
+
+    ret = tsParseInsertSql(pSql);
+    if (pSql->parseRetry < 1 && (ret == TSDB_CODE_TSC_SQL_SYNTAX_ERROR || ret == TSDB_CODE_TSC_INVALID_OPERATION)) {
+      SInsertStatementParam* pInsertParam = &pCmd->insertParam;
+      tscDebug("0x%"PRIx64 " parse insert sql statement failed, code:%s, msg:%s, clear meta cache and retry ", pSql->self, pInsertParam->msg, tstrerror(ret));
+
+      tscResetSqlCmd(pCmd, true, pSql->self);
+      pSql->parseRetry++;
+
+      if ((ret = tsInsertInitialCheck(pSql)) == TSDB_CODE_SUCCESS) {
+        ret = tsParseInsertSql(pSql);
+      }
+    }
+
+    if (ret != TSDB_CODE_SUCCESS) {
+      strncpy(pCmd->payload, pCmd->insertParam.msg, TSDB_DEFAULT_PAYLOAD_SIZE);
+    }
+  } else {
+    SSqlInfo sqlInfo = qSqlParse(pSql->sqlstr);
+    ret = tscValidateSqlInfo(pSql, &sqlInfo);
+    if (ret == TSDB_CODE_TSC_INVALID_OPERATION && pSql->parseRetry < 1 && sqlInfo.type == TSDB_SQL_SELECT) {
+      tscDebug("0x%"PRIx64 " parse query sql statement failed, code:%s, clear meta cache and retry ", pSql->self, tstrerror(ret));
+
+      tscResetSqlCmd(pCmd, true, pSql->self);
+      pSql->parseRetry++;
+
+      ret = tscValidateSqlInfo(pSql, &sqlInfo);
+    }
+
+    SqlInfoDestroy(&sqlInfo);
+  }
+
+
+qSqlParse.c#qSqlParse
+SSqlInfo qSqlParse(const char *pStr) {
+  void *pParser = ParseAlloc(malloc);
+
+  SSqlInfo sqlInfo = {0};
+  sqlInfo.valid = true;
+  sqlInfo.funcs = taosArrayInit(4, sizeof(SStrToken));
+
+  int32_t i = 0;
+  bool inWhere = false;
+  while (1) {
+    SStrToken t0 = {0};
+
+    if (pStr[i] == 0) {
+      Parse(pParser, 0, t0, &sqlInfo);
+      goto abort_parse;
+    }
+
+    t0.n = tGetToken((char *)&pStr[i], &t0.type);
+    t0.z = (char *)(pStr + i);
+    i += t0.n;
+
+    switch (t0.type) {
+      case TK_SPACE:
+      case TK_COMMENT: {
+        break;
+      }
+      case TK_SEMI: {
+        Parse(pParser, 0, t0, &sqlInfo);
+        goto abort_parse;
+      }
+      case TK_QUESTION:
+      case TK_ILLEGAL: {
+        snprintf(sqlInfo.msg, tListLen(sqlInfo.msg), "unrecognized token: \"%s\"", t0.z);
+        sqlInfo.valid = false;
+        goto abort_parse;
+      }
+
+      case TK_HEX:
+      case TK_OCT:
+      case TK_BIN:{
+        snprintf(sqlInfo.msg, tListLen(sqlInfo.msg), "unsupported token: \"%s\"", t0.z);
+        sqlInfo.valid = false;
+        goto abort_parse;
+      }
+      case TK_WHERE:{
+        inWhere = true;
+        Parse(pParser, t0.type, t0, &sqlInfo);
+        if (sqlInfo.valid == false) {
+          goto abort_parse;
+        }
+        break;
+      }
+      case TK_NOW:
+      case TK_TODAY: {
+        //for now(),today() function used in select/where clause
+        if (pStr[i] == '(' && pStr[i + 1] == ')') {
+          if (!inWhere) {
+            t0.type = TK_ID;
+          } else {
+            i += 2;
+          }
+        }
+      }
+      default:
+        Parse(pParser, t0.type, t0, &sqlInfo);
+        if (sqlInfo.valid == false) {
+          goto abort_parse;
+        }
+    }
+  }
+
+abort_parse:
+  ParseFree(pParser, free);
+  return sqlInfo;
+}
+
+
+
+
+tscUtil.c#executeQuery
+void executeQuery(SSqlObj* pSql, SQueryInfo* pQueryInfo) {
+  int32_t code = TSDB_CODE_SUCCESS;
+  int32_t numOfInit = 0;
+
+  if (pSql->cmd.command == TSDB_SQL_RETRIEVE_EMPTY_RESULT) {
+    (*pSql->fp)(pSql->param, pSql, 0);
+    return;
+  } else if (pSql->cmd.command == TSDB_SQL_DELETE_DATA) {
+    code = executeDelete(pSql, pQueryInfo);
+    if (code != TSDB_CODE_SUCCESS) {
+      (*pSql->fp)(pSql->param, pSql, 0);
+    }
+    return ;
+  } 
+
+  if (pSql->cmd.command == TSDB_SQL_SELECT) {
+    tscAddIntoSqlList(pSql);
+  }
+
+  if (taosArrayGetSize(pQueryInfo->pUpstream) > 0) {  // nest query. do execute it firstly
+    code = doInitSubState(pSql, (int32_t) taosArrayGetSize(pQueryInfo->pUpstream));
+    if (code != TSDB_CODE_SUCCESS) {
+      goto _error;
+    }
+
+    for(int32_t i = 0; i < pSql->subState.numOfSub; ++i) {
+      SQueryInfo* pSub = taosArrayGetP(pQueryInfo->pUpstream, i);
+
+      pSql->cmd.active = pSub;
+      pSql->cmd.command = TSDB_SQL_SELECT;
+
+      SSqlObj* pNew = (SSqlObj*)calloc(1, sizeof(SSqlObj));
+      if (pNew == NULL) {
+        code = TSDB_CODE_TSC_OUT_OF_MEMORY;
+        goto _error;
+      }
+
+      pNew->pTscObj   = pSql->pTscObj;
+      pNew->signature = pNew;
+      pNew->sqlstr    = strdup(pSql->sqlstr);
+      pNew->fp        = tscSubqueryCompleteCallback;
+      pNew->fetchFp   = tscSubqueryCompleteCallback;
+      pNew->maxRetry  = pSql->maxRetry;
+      pNew->rootObj   = pSql->rootObj;
+
+      pNew->cmd.resColumnId = TSDB_RES_COL_ID;
+
+      tsem_init(&pNew->rspSem, 0, 0);
+
+      SRetrieveSupport* ps = calloc(1, sizeof(SRetrieveSupport));  // todo use object id
+      if (ps == NULL) {
+        tscFreeSqlObj(pNew);
+        goto _error;
+      }
+
+      ps->pParentSql = pSql;
+      ps->subqueryIndex = i;
+
+      pNew->param = ps;
+      pSql->pSubs[i] = pNew;
+
+      SSqlCmd* pCmd = &pNew->cmd;
+      pCmd->command = TSDB_SQL_SELECT;
+      if ((code = tscAddQueryInfo(pCmd)) != TSDB_CODE_SUCCESS) {
+        goto _error;
+      }
+
+      SQueryInfo* pNewQueryInfo = tscGetQueryInfo(pCmd);
+      tscQueryInfoCopy(pNewQueryInfo, pSub);
+
+      TSDB_QUERY_SET_TYPE(pNewQueryInfo->type, TSDB_QUERY_TYPE_NEST_SUBQUERY);
+      numOfInit++;
+    }
+
+    for(int32_t i = 0; i < pSql->subState.numOfSub; ++i) {
+      SSqlObj* psub = pSql->pSubs[i];
+      registerSqlObj(psub);
+
+      // create sub query to handle the sub query.
+      SQueryInfo* pq = tscGetQueryInfo(&psub->cmd);
+      STableMetaInfo* pSubMeta = tscGetMetaInfo(pq, 0);
+      if (UTIL_TABLE_IS_SUPER_TABLE(pSubMeta) &&
+          pq->command == TSDB_SQL_RETRIEVE_EMPTY_RESULT) {
+        psub->cmd.command = TSDB_SQL_RETRIEVE_EMPTY_RESULT;
+      }
+      executeQuery(psub, pq);
+    }
+
+    return;
+  } else if (hasMoreClauseToTry(pSql)) {
+    if (pthread_mutex_init(&pSql->subState.mutex, NULL) != 0) {
+      goto _error;
+    }
+  }
+
+  pSql->cmd.active = pQueryInfo;
+  doExecuteQuery(pSql, pQueryInfo);
+  return;
+
+  _error:
+  for(int32_t i = 0; i < numOfInit; ++i) {
+    SSqlObj* p = pSql->pSubs[i];
+    tscFreeSqlObj(p);
+  }
+
+  pSql->res.code = code;
+  pSql->subState.numOfSub = 0;   // not initialized sub query object will not be freed
+  tfree(pSql->subState.states);
+  tfree(pSql->pSubs);
+  tscAsyncResultOnError(pSql);
+}
+
+
+tscDelete.c#executeDelete
+int32_t executeDelete(SSqlObj* pSql, SQueryInfo* pQueryInfo) {
+
+  int32_t ret = TSDB_CODE_SUCCESS;
+  STableMetaInfo *pTableMetaInfo = tscGetMetaInfo(pQueryInfo, 0);
+
+  if(!UTIL_TABLE_IS_SUPER_TABLE(pTableMetaInfo)) {
+    // not super table
+    pSql->cmd.active = pQueryInfo;
+    return tscBuildAndSendRequest(pSql, pQueryInfo);
+  }
+
+  //
+  // super table
+  //
+
+  SSqlRes *pRes = &pSql->res;
+  SSqlCmd *pCmd = &pSql->cmd;
+  
+  // check cancel
+  if (pRes->code == TSDB_CODE_TSC_QUERY_CANCELLED) {
+    pCmd->command = TSDB_SQL_RETRIEVE_GLOBALMERGE;  // enable the abort of kill super table function.
+    return pRes->code;
+  }
+
+  if(pTableMetaInfo->vgroupList == NULL) {
+    tscError(":CDEL SQL:%p tablename=%s vgroupList is NULL.", pSql, pTableMetaInfo->name.tname);
+    return TSDB_CODE_VND_INVALID_VGROUP_ID;
+  }
+  
+  SSubqueryState *pState = &pSql->subState;
+  int32_t numOfSub = pTableMetaInfo->vgroupList->numOfVgroups;
+
+  ret = doInitSubState(pSql, numOfSub);
+  if (ret != 0) {
+    tscAsyncResultOnError(pSql);
+    return ret;
+  }
+
+  tscDebug("0x%"PRIx64":CDEL retrieved query data from %d vnode(s)", pSql->self, pState->numOfSub);
+  pRes->code = TSDB_CODE_SUCCESS;
+  
+  int32_t i;
+  for (i = 0; i < pState->numOfSub; ++i) {
+    // vgroup
+    SVgroupMsg* pVgroupMsg = &pTableMetaInfo->vgroupList->vgroups[i];
+
+    // malloc each support
+    SRetrieveSupport *trs = (SRetrieveSupport *)calloc(1, sizeof(SRetrieveSupport));
+    if (trs == NULL) {
+      tscError("0x%"PRIx64" failed to malloc buffer for SRetrieveSupport, orderOfSub:%d, reason:%s", pSql->self, i, strerror(errno));
+      break;
+    }
+    trs->subqueryIndex = i;
+    trs->pParentSql    = pSql;
+
+    // malloc sub SSqlObj
+    SSqlObj *pNew = tscCreateSTableSubDelete(pSql, pVgroupMsg, trs);
+    if (pNew == NULL) {
+      tscError("0x%"PRIx64"CDEL failed to malloc buffer for subObj, orderOfSub:%d, reason:%s", pSql->self, i, strerror(errno));
+      tfree(trs);
+      break;
+    }
+    pSql->pSubs[i] = pNew;
+  }
+  
+  if (i < pState->numOfSub) {
+    tscError("0x%"PRIx64":CDEL failed to prepare subdelete structure and launch subqueries", pSql->self);
+    pRes->code = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    
+    doCleanupSubqueries(pSql, i);
+    return pRes->code;   // free all allocated resource
+  }
+  
+  if (pRes->code == TSDB_CODE_TSC_QUERY_CANCELLED) {
+    doCleanupSubqueries(pSql, i);
+    return pRes->code;
+  }
+
+  // send sub sql
+  doConcurrentlySendSubQueries(pSql);
+  //return TSDB_CODE_TSC_QUERY_CANCELLED;
+
+  return TSDB_CODE_SUCCESS;
+}
+
+
+tscServer.c#tscBuildAndSendRequest
+int tscBuildAndSendRequest(SSqlObj *pSql, SQueryInfo* pQueryInfo) {
+  char name[TSDB_TABLE_FNAME_LEN] = {0};
+
+  SSqlCmd *pCmd = &pSql->cmd;
+  uint32_t type = 0;
+
+  if (pQueryInfo == NULL) {
+     pQueryInfo = tscGetQueryInfo(pCmd);
+  }
+
+  STableMetaInfo *pTableMetaInfo = NULL;
+
+  if (pQueryInfo != NULL) {
+    pTableMetaInfo = tscGetMetaInfo(pQueryInfo, 0);
+    if (pTableMetaInfo != NULL) {
+      tNameExtractFullName(&pTableMetaInfo->name, name);
+    }
+
+    type = pQueryInfo->type;
+
+    // while numOfTables equals to 0, it must be Heartbeat
+    assert((pQueryInfo->numOfTables == 0 && (pQueryInfo->command == TSDB_SQL_HB || pSql->cmd.command == TSDB_SQL_RETRIEVE_FUNC)) || pQueryInfo->numOfTables > 0);
+  }
+
+  tscDebug("0x%"PRIx64" SQL cmd:%s will be processed, name:%s, type:%d", pSql->self, sqlCmd[pCmd->command], name, type);
+  if (pCmd->command < TSDB_SQL_MGMT && pCmd->command != TSDB_SQL_DELETE_DATA) { // the pTableMetaInfo cannot be NULL
+    if (pTableMetaInfo == NULL) {
+      pSql->res.code = TSDB_CODE_TSC_APP_ERROR;
+      return pSql->res.code;
+    }
+  } else if (pCmd->command >= TSDB_SQL_LOCAL) {
+    return (*tscProcessMsgRsp[pCmd->command])(pSql);
+  }
+  
+  return doBuildAndSendMsg(pSql);
+}
+
+
+tscServer.c#doBuildAndSendMsg
+int doBuildAndSendMsg(SSqlObj *pSql) {
+  SSqlCmd *pCmd = &pSql->cmd;
+  SSqlRes *pRes = &pSql->res;
+
+  if (pCmd->command == TSDB_SQL_SELECT ||
+      pCmd->command == TSDB_SQL_FETCH ||
+      pCmd->command == TSDB_SQL_RETRIEVE ||
+      pCmd->command == TSDB_SQL_INSERT ||
+      pCmd->command == TSDB_SQL_CONNECT ||
+      pCmd->command == TSDB_SQL_HB ||
+      pCmd->command == TSDB_SQL_RETRIEVE_FUNC ||
+      pCmd->command == TSDB_SQL_STABLEVGROUP) {
+    pRes->code = tscBuildMsg[pCmd->command](pSql, NULL);
+  }
+  
+  if (pRes->code != TSDB_CODE_SUCCESS) {
+    tscAsyncResultOnError(pSql);
+    return TSDB_CODE_SUCCESS;
+  }
+
+  int32_t code = tscSendMsgToServer(pSql);
+
+  // NOTE: if code is TSDB_CODE_SUCCESS, pSql may have been released here already by other threads.
+  if (code != TSDB_CODE_SUCCESS) {
+    pRes->code = code;
+    tscAsyncResultOnError(pSql);
+    return  TSDB_CODE_SUCCESS;
+  }
+  
+  return TSDB_CODE_SUCCESS;
+}
+
+
+
+tscServer.c#tscSendMsgToServer
+int tscSendMsgToServer(SSqlObj *pSql) {
+  STscObj* pObj = pSql->pTscObj;
+  SSqlCmd* pCmd = &pSql->cmd;
+  
+  char *pMsg = rpcMallocCont(pCmd->payloadLen);
+  if (NULL == pMsg) {
+    tscError("0x%"PRIx64" msg:%s malloc failed", pSql->self, taosMsg[pSql->cmd.msgType]);
+    return TSDB_CODE_TSC_OUT_OF_MEMORY;
+  }
+
+  // set the mgmt ip list
+  if (pSql->cmd.command >= TSDB_SQL_MGMT) {
+    tscDumpMgmtEpSet(pSql);
+  }
+
+  memcpy(pMsg, pSql->cmd.payload, pSql->cmd.payloadLen);
+
+  SRpcMsg rpcMsg = {
+      .msgType = pSql->cmd.msgType,
+      .pCont   = pMsg,
+      .contLen = pSql->cmd.payloadLen,
+      .ahandle = (void*)pSql->self,
+      .handle  = NULL,
+      .code    = 0
+  };
+
+  if ((rpcMsg.msgType == TSDB_MSG_TYPE_SUBMIT) && (tsShortcutFlag & TSDB_SHORTCUT_RB_RPC_SEND_SUBMIT)) {
+    rpcFreeCont(rpcMsg.pCont);
+    return TSDB_CODE_RPC_SHORTCUT;
+  }
+
+  rpcSendRequest(pObj->pRpcObj->pDnodeConn, &pSql->epSet, &rpcMsg, &pSql->rpcRid);
+  return TSDB_CODE_SUCCESS;
+}
+
+rpcMain.c#rpcSendRequest
+void rpcSendRequest(void *shandle, const SRpcEpSet *pEpSet, SRpcMsg *pMsg, int64_t *pRid) {
+  SRpcInfo       *pRpc = (SRpcInfo *)shandle;
+  SRpcReqContext *pContext;
+
+  int contLen = rpcCompressRpcMsg(pMsg->pCont, pMsg->contLen);
+  pContext = (SRpcReqContext *) ((char*)pMsg->pCont-sizeof(SRpcHead)-sizeof(SRpcReqContext));
+  pContext->ahandle = pMsg->ahandle;
+  pContext->pRpc = (SRpcInfo *)shandle;
+  pContext->epSet = *pEpSet;
+  pContext->contLen = contLen;
+  pContext->pCont = pMsg->pCont;
+  pContext->msgType = pMsg->msgType;
+  pContext->oldInUse = pEpSet->inUse;
+
+  pContext->connType = RPC_CONN_UDPC; 
+
+  if (contLen > tsRpcMaxUdpSize || tsRpcForceTcp) pContext->connType = RPC_CONN_TCPC;
+
+  // connection type is application specific. 
+  // for TDengine, all the query, show commands shall have TCP connection
+  char type = pMsg->msgType;
+  if (type == TSDB_MSG_TYPE_QUERY || type == TSDB_MSG_TYPE_CM_RETRIEVE || type == TSDB_MSG_TYPE_SUBMIT
+    || type == TSDB_MSG_TYPE_FETCH || type == TSDB_MSG_TYPE_CM_STABLE_VGROUP
+    || type == TSDB_MSG_TYPE_CM_TABLES_META || type == TSDB_MSG_TYPE_CM_TABLE_META
+    || type == TSDB_MSG_TYPE_CM_SHOW || type == TSDB_MSG_TYPE_DM_STATUS || type == TSDB_MSG_TYPE_CM_ALTER_TABLE)
+    pContext->connType = RPC_CONN_TCPC;
+
+  pContext->rid = taosAddRef(tsRpcRefId, pContext);
+  if (pRid) *pRid = pContext->rid;
+
+  rpcSendReqToServer(pRpc, pContext);
+}
+
+
+rpcMain.c#rpcSendReqToServer
+static void rpcSendReqToServer(SRpcInfo *pRpc, SRpcReqContext *pContext) {
+  SRpcHead  *pHead = rpcHeadFromCont(pContext->pCont);
+  char      *msg = (char *)pHead;
+  int        msgLen = rpcMsgLenFromCont(pContext->contLen);
+  char       msgType = pContext->msgType;
+
+  pContext->numOfTry++;
+  SRpcConn *pConn = rpcSetupConnToServer(pContext);
+  if (pConn == NULL) {
+    pContext->code = terrno;
+    taosTmrStart(rpcProcessConnError, 1, pContext, pRpc->tmrCtrl);
+    return;
+  }
+
+  pContext->pConn = pConn;
+  pConn->ahandle = pContext->ahandle;
+  rpcLockConn(pConn);
+
+  // set the message header  
+  pHead->version = 1;
+  pHead->msgVer = htonl(tsVersion >> 8);
+  pHead->msgType = msgType;
+  pHead->encrypt = 0;
+  pConn->tranId++;
+  if ( pConn->tranId == 0 ) pConn->tranId++;
+  pHead->tranId = pConn->tranId;
+  pHead->sourceId = pConn->ownId;
+  pHead->destId = pConn->peerId;
+  pHead->port = 0;
+  pHead->linkUid = pConn->linkUid;
+  pHead->ahandle = (uint64_t)pConn->ahandle;
+  memcpy(pHead->user, pConn->user, tListLen(pHead->user));
+
+  // set the connection parameters
+  pConn->outType = msgType;
+  pConn->outTranId = pHead->tranId;
+  pConn->pReqMsg = msg;
+  pConn->reqMsgLen = msgLen;
+  pConn->pContext = pContext;
+
+  rpcSendMsgToPeer(pConn, msg, msgLen);
+  if (pConn->connType != RPC_CONN_TCPC)
+    taosTmrReset(rpcProcessRetryTimer, tsRpcTimer, pConn, pRpc->tmrCtrl, &pConn->pTimer);
+
+  rpcUnlockConn(pConn);
+}
+
+
+rpcMain.c#rpcSetupConnToServer
+static SRpcConn *rpcSetupConnToServer(SRpcReqContext *pContext) {
+  SRpcConn   *pConn;
+  SRpcInfo   *pRpc = pContext->pRpc;
+  SRpcEpSet  *pEpSet = &pContext->epSet;
+
+  pConn = rpcGetConnFromCache(pRpc->pCache, pEpSet->fqdn[pEpSet->inUse], pEpSet->port[pEpSet->inUse], pContext->connType);
+  if ( pConn == NULL || pConn->user[0] == 0) {
+    pConn = rpcOpenConn(pRpc, pEpSet->fqdn[pEpSet->inUse], pEpSet->port[pEpSet->inUse], pContext->connType);
+  } 
+
+  if (pConn) {
+    pConn->tretry = 0;
+    pConn->ahandle = pContext->ahandle;
+    snprintf(pConn->info, sizeof(pConn->info), "%s %p %p", pRpc->label, pConn, pConn->ahandle);
+    pConn->tretry = 0;
+  } else {
+    tError("%s %p, failed to set up connection(%s)", pRpc->label, pContext->ahandle, tstrerror(terrno));
+  }
+
+  return pConn;
+}
+
+
+rpcMain.c#rpcSendMsgToPeer
+static void rpcSendMsgToPeer(SRpcConn *pConn, void *msg, int msgLen) {
+  int        writtenLen = 0;
+  SRpcHead  *pHead = (SRpcHead *)msg;
+
+  msgLen = rpcAddAuthPart(pConn, msg, msgLen);
+
+  if ( rpcIsReq(pHead->msgType)) {
+    tDebug("%s, %s is sent to %s:%hu, len:%d sig:0x%08x:0x%08x:%d",
+           pConn->info, taosMsg[pHead->msgType], pConn->peerFqdn, pConn->peerPort, 
+           msgLen, pHead->sourceId, pHead->destId, pHead->tranId);
+  } else {
+    if (pHead->code == 0) pConn->secured = 1; // for success response, set link as secured
+    tDebug("%s, %s is sent to 0x%x:%hu, code:0x%x len:%d sig:0x%08x:0x%08x:%d",
+           pConn->info, taosMsg[pHead->msgType], pConn->peerIp, pConn->peerPort, 
+           htonl(pHead->code), msgLen, pHead->sourceId, pHead->destId, pHead->tranId);
+  }
+
+  //tTrace("connection type is: %d", pConn->connType);
+  writtenLen = (*taosSendData[pConn->connType])(pConn->peerIp, pConn->peerPort, pHead, msgLen, pConn->chandle);
+
+  if (writtenLen != msgLen) {
+    tError("%s, failed to send, msgLen:%d written:%d, reason:%s", pConn->info, msgLen, writtenLen, strerror(errno));
+  }
+ 
+  tDump(msg, msgLen);
+}
+
+
+rpcMain.c#rpcAddAuthPart
+static void rpcSendMsgToPeer(SRpcConn *pConn, void *msg, int msgLen) {
+  int        writtenLen = 0;
+  SRpcHead  *pHead = (SRpcHead *)msg;
+
+  msgLen = rpcAddAuthPart(pConn, msg, msgLen);
+
+  if ( rpcIsReq(pHead->msgType)) {
+    tDebug("%s, %s is sent to %s:%hu, len:%d sig:0x%08x:0x%08x:%d",
+           pConn->info, taosMsg[pHead->msgType], pConn->peerFqdn, pConn->peerPort, 
+           msgLen, pHead->sourceId, pHead->destId, pHead->tranId);
+  } else {
+    if (pHead->code == 0) pConn->secured = 1; // for success response, set link as secured
+    tDebug("%s, %s is sent to 0x%x:%hu, code:0x%x len:%d sig:0x%08x:0x%08x:%d",
+           pConn->info, taosMsg[pHead->msgType], pConn->peerIp, pConn->peerPort, 
+           htonl(pHead->code), msgLen, pHead->sourceId, pHead->destId, pHead->tranId);
+  }
+
+  //tTrace("connection type is: %d", pConn->connType);
+  writtenLen = (*taosSendData[pConn->connType])(pConn->peerIp, pConn->peerPort, pHead, msgLen, pConn->chandle);
+
+  if (writtenLen != msgLen) {
+    tError("%s, failed to send, msgLen:%d written:%d, reason:%s", pConn->info, msgLen, writtenLen, strerror(errno));
+  }
+ 
+  tDump(msg, msgLen);
+}
+
+
+rpcMain.c
+int (*taosSendData[])(uint32_t ip, uint16_t port, void *data, int len, void *chandle) = {
+    taosSendUdpData, 
+    taosSendUdpData, 
+    taosSendTcpData, 
+    taosSendTcpData
+};
+
+
+
+
+rpcUdp.c#taosSendUdpData
+int taosSendUdpData(uint32_t ip, uint16_t port, void *data, int dataLen, void *chandle) {
+  SUdpConn *pConn = (SUdpConn *)chandle;
+
+  if (pConn == NULL) return -1;
+
+  struct sockaddr_in destAdd;
+  memset(&destAdd, 0, sizeof(destAdd));
+  destAdd.sin_family = AF_INET;
+  destAdd.sin_addr.s_addr = ip;
+  destAdd.sin_port = htons(port);
+
+  int ret = (int)taosSendto(pConn->fd, data, (size_t)dataLen, 0, (struct sockaddr *)&destAdd, sizeof(destAdd));
+
+  return ret;
+}
+
+
+rpcTcp.c#taosSendTcpData
+int taosSendTcpData(uint32_t ip, uint16_t port, void *data, int len, void *chandle) {
+  SFdObj *pFdObj = chandle;
+  if (pFdObj == NULL || pFdObj->signature != pFdObj) return -1;
+  SThreadObj *pThreadObj = pFdObj->pThreadObj;
+
+  int ret = taosWriteMsg(pFdObj->fd, data, len);
+  tTrace("%s %p TCP data is sent, FD:%p fd:%d bytes:%d", pThreadObj->label, pFdObj->thandle, pFdObj, pFdObj->fd, ret);
+
+  return ret;
+}
+
+
+tsocket.c#taosWriteMsg
+int32_t taosWriteMsg(SOCKET fd, void *buf, int32_t nbytes) {
+  int32_t nleft, nwritten;
+  char *  ptr = (char *)buf;
+
+  nleft = nbytes;
+
+  while (nleft > 0) {
+    nwritten = (int32_t)taosWriteSocket(fd, (char *)ptr, (size_t)nleft);
+    if (nwritten <= 0) {
+      if (errno == EINTR /* || errno == EAGAIN || errno == EWOULDBLOCK */)
+        continue;
+      else
+        return -1;
+    } else {
+      nleft -= nwritten;
+      ptr += nwritten;
+    }
+
+    if (errno == SIGPIPE || errno == EPIPE) {
+      return -1;
+    }
+  }
+
+  return (nbytes - nleft);
+}
+
+
+
+tscUtil.c#doInitSubState
+int32_t doInitSubState(SSqlObj* pSql, int32_t numOfSubqueries) {
+  //bug fix. Above doInitSubState level, the loop invocation with the same SSqlObj will be fail.
+  //assert(pSql->subState.numOfSub == 0 && pSql->pSubs == NULL && pSql->subState.states == NULL);  
+  if(pSql->pSubs) {
+    free(pSql->pSubs);
+    pSql->pSubs = NULL;
+  }
+  
+  if(pSql->subState.states) {
+    free(pSql->subState.states);
+    pSql->subState.states = NULL;
+  }
+  
+  pSql->subState.numOfSub = numOfSubqueries;
+  
+  pSql->pSubs = calloc(pSql->subState.numOfSub, POINTER_BYTES);
+  pSql->subState.states = calloc(pSql->subState.numOfSub, sizeof(int8_t));
+
+  int32_t code = pthread_mutex_init(&pSql->subState.mutex, NULL);
+  if (pSql->pSubs == NULL || pSql->subState.states == NULL || code != 0) {
+    return TSDB_CODE_TSC_OUT_OF_MEMORY;
+  }
+
+  return TSDB_CODE_SUCCESS;
+}
+
+
+tscDelete.c#tscCreateSTableSubDelete
+SSqlObj *tscCreateSTableSubDelete(SSqlObj *pSql, SVgroupMsg* pVgroupMsg, SRetrieveSupport *trsupport) {
+  // Init
+  SSqlCmd* pCmd = &pSql->cmd;
+  SSqlObj* pNew = (SSqlObj*)calloc(1, sizeof(SSqlObj));
+  if (pNew == NULL) {
+    tscError("0x%"PRIx64":CDEL new subdelete failed.", pSql->self);
+    terrno = TSDB_CODE_TSC_OUT_OF_MEMORY;
+    return NULL;
+  }
+
+  pNew->pTscObj   = pSql->pTscObj;
+  pNew->signature = pNew;
+  pNew->sqlstr    = strdup(pSql->sqlstr);
+  pNew->rootObj   = pSql->rootObj;
+  pNew->fp        = tscSubDeleteCallback;
+  pNew->fetchFp   = tscSubDeleteCallback;
+  pNew->param     = trsupport;
+  pNew->maxRetry  = TSDB_MAX_REPLICA;
+
+  SSqlCmd* pNewCmd  = &pNew->cmd;
+  memcpy(pNewCmd, pCmd, sizeof(SSqlCmd));
+  // set zero
+  pNewCmd->pQueryInfo = NULL;
+  pNewCmd->active = NULL;
+  pNewCmd->payload = NULL;
+  pNewCmd->allocSize = 0;
+  
+  // payload copy
+  int32_t ret = tscAllocPayload(pNewCmd, pCmd->payloadLen);
+  if (ret != TSDB_CODE_SUCCESS) {
+    tscError("0x%"PRIx64":CDEL , sub delete alloc payload failed. errcode=%d", pSql->self, ret);
+    free(pNew);
+    return NULL;
+  }
+  memcpy(pNewCmd->payload, pCmd->payload, pCmd->payloadLen);
+  
+  // update vgroup id
+  writeMsgVgId(pNewCmd->payload ,pVgroupMsg->vgId);
+
+  tsem_init(&pNew->rspSem, 0, 0);
+  registerSqlObj(pNew);
+  tscDebug("0x%"PRIx64":CDEL new sub insertion: %p", pSql->self, pNew);
+
+  SNewVgroupInfo vgroupInfo = {0};
+  taosHashGetClone(UTIL_GET_VGROUPMAP(pSql), &pVgroupMsg->vgId, sizeof(pVgroupMsg->vgId), NULL, &vgroupInfo);
+  tscDumpEpSetFromVgroupInfo(&pNew->epSet, &vgroupInfo);
+
+  return pNew;
+}
+
+
+----------------------------
+2022.12.02 - 2022.12.05 读TDengine启动过程
+src\dnode\src\dnodeMain.c
+static SStep tsDnodeSteps[] = {
+  {"dnode-tfile",     tfInit,              tfCleanup},// tfile 初始化
+  {"dnode-rpc",       rpcInit,             rpcCleanup},// rpc 初始化
+  {"dnode-globalcfg", taosCheckGlobalCfg,  NULL},// SGlobalCfg check
+  {"dnode-storage",   dnodeInitStorage,    dnodeCleanupStorage},// storage 初始化
+  {"dnode-cfg",       dnodeInitCfg,        dnodeCleanupCfg},// 读取/dnodeCfg.json配置文件, dnodeId 、clusterId
+  {"dnode-eps",       dnodeInitEps,        dnodeCleanupEps},// 读取/dnodeEps.json配置文件, dnodeNum、dnodeInfos、dnodeId、dnodeFqdn、dnodePort
+  {"dnode-minfos",    dnodeInitMInfos,     dnodeCleanupMInfos},// 读取/mnodeEpSet.json配置文件，inUse、nodeNum、nodeInfos、nodeId、nodeEp
+  {"dnode-wal",       walInit,             walCleanUp},// wal(write ahead log)线程 初始化
+  {"dnode-sync",      syncInit,            syncCleanUp},// sync module 初始化，用于syncFreeNode、syncFreePeer
+  {"dnode-check",     dnodeInitCheck,      dnodeCleanupCheck},     // NOTES: dnodeInitCheck must be behind the dnodeinitStorage component !!!  // dnode初始化验证
+  {"dnode-vread",     dnodeInitVRead,      dnodeCleanupVRead},// tsVQueryWP、 tsVFetchWP线程池初始化
+  {"dnode-vwrite",    dnodeInitVWrite,     dnodeCleanupVWrite},// tsVWriteWP线程池初始化
+  {"dnode-vmgmt",     dnodeInitVMgmt,      dnodeCleanupVMgmt},// vmgmt初始化，并且初始化vnode-worker(tsVMWorkerPool线程池 初始化)、vnode-write(设置vnodeProcessWriteMsgFp)、vnode-read、vnode-hash、tsdb-queue(commitQueue初始化)
+  {"dnode-mread",     dnodeInitMRead,      dnodeCleanupMRead},// tsMReadWP线程池初始化
+  {"dnode-mwrite",    dnodeInitMWrite,     dnodeCleanupMWrite},// tsMWriteWP线程池初始化
+  {"dnode-mpeer",     dnodeInitMPeer,      dnodeCleanupMPeer}, // tsMPeerWP线程池初始化
+  {"dnode-client",    dnodeInitClient,     dnodeCleanupClient},// mnode rpc client初始化
+  {"dnode-server",    dnodeInitServer,     dnodeCleanupServer},// dnode inter-dnodes rpc client初始化
+  {"dnode-vnodes",    dnodeInitVnodes,     dnodeCleanupVnodes},// Vnodes 初始化、start，执行vnodeOpen(复杂) tsVnodeSteps[]
+  {"dnode-modules",   dnodeInitModules,    dnodeCleanupModules},// modules 初始化、start，tsModule{mnode、http、monitor} 初始化 , tsMnodeSteps[]
+  {"dnode-shell",     dnodeInitShell,      dnodeCleanupShell},// dnode shell rpc server 初始化 , 设置dnodeProcessShellMsgFp
+  {"dnode-statustmr", dnodeInitStatusTimer,dnodeCleanupStatusTimer},// statusTimer 初始化
+  {"dnode-telemetry", dnodeInitTelemetry,  dnodeCleanupTelemetry},// dnode telemetry 初始化
+};
+
+src\vnode\src\vnodeMgmt.c
+static SStep tsVnodeSteps[] = {
+  {"vnode-worker", vnodeInitMWorker,    vnodeCleanupMWorker}, // tsVMWorkerPool线程池 初始化
+  {"vnode-write",  vnodeInitWrite,      vnodeCleanupWrite},// 设置vnodeProcessWriteMsgFp
+  {"vnode-read",   vnodeInitRead,       vnodeCleanupRead},// 设置vnodeProcessReadMsgFp
+  {"vnode-hash",   vnodeInitHash,       vnodeCleanupHash},
+  {"tsdb-queue",   tsdbInitCommitQueue, tsdbDestroyCommitQueue}// commitQueue初始化
+};
+
+src\mnode\src\mnodeMain.c
+static SStep tsMnodeSteps[] = {
+  {"sdbref",  sdbInitRef,       sdbCleanUpRef},// sdb ref初始化
+  {"profile", mnodeInitProfile, mnodeCleanupProfile},// conn
+  {"cluster", mnodeInitCluster, mnodeCleanupCluster},// cluster data 初始化
+  {"accts",   mnodeInitAccts,   mnodeCleanupAccts},// accounts data 初始化
+  {"users",   mnodeInitUsers,   mnodeCleanupUsers},// users data 初始化
+  {"dnodes",  mnodeInitDnodes,  mnodeCleanupDnodes},// dnodes data 初始化
+  {"dbs",     mnodeInitDbs,     mnodeCleanupDbs},// db data 初始化
+  {"vgroups", mnodeInitVgroups, mnodeCleanupVgroups},// vgroups data 初始化
+  {"tables",  mnodeInitTables,  mnodeCleanupTables},// mnodeInitSuperTables 初始化、mnodeInitChildTables 初始化、设置mnodeAdd...Handle
+  {"mnodes",  mnodeInitMnodes,  mnodeCleanupMnodes},// mnodes data 初始化
+  {"sdb",     sdbInit,          sdbCleanUp},// sdb data 初始化，MnodesNum==1，设置nodeRole为master
+  {"balance", bnInit,           bnCleanUp},// balance 初始化
+  {"grant",   grantInit,        grantCleanUp},// return 0 
+  {"show",    mnodeInitShow,    mnodeCleanUpShow}// show
+};
+
+
+----------------------------
+2022.12.05 - 2022.12.07 读mnode功能模块源码
+
+
+
+
+----------------------------
+2022.12.06 - 2022.12.07 读query模块源码
+
+
+
+
+---------------------------
+2022.12.06 - 2022.12.07 读msg处理过程
+trpc.h#SRpcInit
+typedef struct SRpcInit {
+  uint16_t localPort; // local port
+  char  *label;        // for debug purpose
+  int    numOfThreads; // number of threads to handle connections
+  int    sessions;     // number of sessions allowed
+  int8_t connType;     // TAOS_CONN_UDP, TAOS_CONN_TCPC, TAOS_CONN_TCPS
+  int    idleTime;     // milliseconds, 0 means idle timer is disabled
+
+  // the following is for client app ecurity only
+  char *user;         // user name
+  char  spi;          // security parameter index
+  char  encrypt;      // encrypt algorithm
+  char *secret;       // key for authentication
+  char *ckey;         // ciphering key
+
+  // call back to process incoming msg, code shall be ignored by server app
+  void (*cfp)(SRpcMsg *, SRpcEpSet *);  
+
+  // call back to retrieve the client auth info, for server app only 
+  int  (*afp)(char *tableId, char *spi, char *encrypt, char *secret, char *ckey);
+} SRpcInit;
+
+-------------------
+2022.12.08 读dnodePeer.c、dnodeShell.c中处理msg的过程
+rpcMain.c#rpcSendRequest
+void rpcSendRequest(void *shandle, const SRpcEpSet *pEpSet, SRpcMsg *pMsg, int64_t *pRid) {
+  SRpcInfo       *pRpc = (SRpcInfo *)shandle;
+  SRpcReqContext *pContext;
+
+  int contLen = rpcCompressRpcMsg(pMsg->pCont, pMsg->contLen);
+  pContext = (SRpcReqContext *) ((char*)pMsg->pCont-sizeof(SRpcHead)-sizeof(SRpcReqContext));
+  pContext->ahandle = pMsg->ahandle;
+  pContext->pRpc = (SRpcInfo *)shandle;
+  pContext->epSet = *pEpSet;
+  pContext->contLen = contLen;
+  pContext->pCont = pMsg->pCont;
+  pContext->msgType = pMsg->msgType;
+  pContext->oldInUse = pEpSet->inUse;
+
+  pContext->connType = RPC_CONN_UDPC; 
+  if (contLen > tsRpcMaxUdpSize) pContext->connType = RPC_CONN_TCPC;
+
+  // connection type is application specific. 
+  // for TDengine, all the query, show commands shall have TCP connection
+  char type = pMsg->msgType;
+  if (type == TSDB_MSG_TYPE_QUERY || type == TSDB_MSG_TYPE_CM_RETRIEVE
+    || type == TSDB_MSG_TYPE_FETCH || type == TSDB_MSG_TYPE_CM_STABLE_VGROUP
+    || type == TSDB_MSG_TYPE_CM_TABLES_META || type == TSDB_MSG_TYPE_CM_TABLE_META
+    || type == TSDB_MSG_TYPE_CM_SHOW || type == TSDB_MSG_TYPE_DM_STATUS)
+    pContext->connType = RPC_CONN_TCPC;
+  
+  pContext->rid = taosAddRef(tsRpcRefId, pContext);
+  if (pRid) *pRid = pContext->rid;
+
+  rpcSendReqToServer(pRpc, pContext);
+}
+
+
+-----------
+2022.12.09、2022.12.10 读dnodeVRead.c#dnodeDispatchToVReadQueue
+
+
+-----------
+2022.12.11 ttimer.c、tsched.c
+
+bnThread.c
+    taosTmrReset(bnProcessTimer, mseconds, (void *)(int64_t)mseconds, tsMnodeTmr, &tsBnThread.timer);
+	taosTmrReset(bnProcessTimer, tsStatusInterval * 1000, NULL, tsMnodeTmr, &tsBnThread.timer);
+	
+dnodeMWrite.c
+    taosTmrReset(dnodeDoDelayReprocessMWriteMsg, 300, mnodeMsg, tsDnodeTmr, &unUsed);
+
+dnodeVnodes.c
+    taosTmrReset(dnodeSendStatusMsg, 500, NULL, tsDnodeTmr, &tsStatusTimer);
+	taosTmrReset(dnodeSendStatusMsg, tsStatusInterval * 1000, NULL, tsDnodeTmr, &tsStatusTimer);
+	taosTmrReset(dnodeSendStatusMsg, tsStatusInterval * 1000, NULL, tsDnodeTmr, &tsStatusTimer);
+	taosTmrReset(dnodeSendStatusMsg, tsStatusInterval * 1000, NULL, tsDnodeTmr, &tsStatusTimer);
+	taosTmrReset(dnodeSendStatusMsg, tsStatusInterval * 1000, NULL, tsDnodeTmr, &tsStatusTimer);
+	taosTmrReset(dnodeSendStatusMsg, tsStatusInterval * 1000, NULL, tsDnodeTmr, &tsStatusTimer);
+	taosTmrReset(dnodeSendStatusMsg, 3, NULL, tsDnodeTmr, &tsStatusTimer);
+	
+mnodeSdb.c
+	taosTmrReset(sdbUpdateSyncTmrFp, 200, NULL, tsMnodeTmr, &tsSdbTmr);
+
+rpcCache.c
+    taosTmrReset(rpcCleanConnCache, (int32_t)(pCache->keepTimer * 2), pCache, pCache->tmrCtrl, &pCache->pTimer);
+    taosTmrReset(rpcCleanConnCache, (int32_t)(pCache->keepTimer * 2), pCache, pCache->tmrCtrl, &pCache->pTimer);
+	
+rpcMain.c
+    taosTmrReset(rpcProcessIdleTimer, pRpc->idleTime, pConn, pRpc->tmrCtrl, &pConn->pIdleTimer);
+	taosTmrReset(rpcProcessRetryTimer, tsRpcTimer, pConn, pRpc->tmrCtrl, &pConn->pTimer);
+	
+syncMain.c
+    taosTmrReset(syncCheckPeerConnection, checkMs, (void *)pPeer->rid, tsSyncTmrCtrl, &pPeer->timer);    
+    taosTmrReset(syncCheckPeerConnection, SYNC_CHECK_INTERVAL, (void *)pPeer->rid, tsSyncTmrCtrl, &pPeer->timer);
+    taosTmrReset(syncTryRecoverFromMaster, 500 + (pNode->vgId * 10) % 200, (void *)pPeer->rid, tsSyncTmrCtrl, &pPeer->timer);
+    taosTmrReset(syncNotStarted, SYNC_CHECK_INTERVAL, (void *)pPeer->rid, tsSyncTmrCtrl, &pPeer->timer);
+    taosTmrReset(syncCheckPeerConnection, SYNC_CHECK_INTERVAL, (void *)pPeer->rid, tsSyncTmrCtrl, &pPeer->timer);
+    taosTmrReset(syncCheckPeerConnection, SYNC_CHECK_INTERVAL, (void *)pPeer->rid, tsSyncTmrCtrl, &pPeer->timer);
+
+vnodeWrite.c
+    taosTmrReset(vnodeFlowCtrlMsgToWQueue, 100, pWrite, tsDnodeTmr, &unUsed);
+	
+tsched.c
+    taosTmrReset(taosDumpSchedulerStatus, DUMP_SCHEDULER_TIME_WINDOW, pSched, pSched->pTmrCtrl, &pSched->pTimer);
+	
+tscServer.c
+	taosTmrReset(tscProcessActivityTimer, waitingDuring, (void *)pObj->rid, tscTmr, &pObj->pTimer);
+	
+tscSub.c
+    taosTmrReset(tscProcessSubscriptionTimer, interval, pSub, tscTmr, &pSub->pTimer);
+	
+tscSystem.c
+    taosTmrReset(tscCheckDiskUsage, 20 * 1000, NULL, tscTmr, &tscCheckDiskUsageTmr);
+	
+	
+------------
+2022.12.12 读取cJSON.h 或 cJSON.c
+
+解析json文件
+CJSON_PUBLIC(cJSON *) cJSON_Parse(const char *value)
+{
+    return cJSON_ParseWithOpts(value, 0, 0);
+}
+
+解析json object
+CJSON_PUBLIC(cJSON *) cJSON_GetObjectItem(const cJSON * const object, const char * const string)
+{
+    return get_object_item(object, string, false);
+}
+
+获取数组大小
+CJSON_PUBLIC(int) cJSON_GetArraySize(const cJSON *array)
+{
+    cJSON *child = NULL;
+    size_t size = 0;
+
+    if (array == NULL)
+    {
+        return 0;
+    }
+
+    child = array->child;
+
+    while(child != NULL)
+    {
+        size++;
+        child = child->next;
+    }
+
+    /* FIXME: Can overflow here. Cannot be fixed without breaking the API */
+
+    return (int)size;
+}
+
+------------
+2022.12.12 阅读tref.c
+int taosOpenRef(int max, void (*fp)(void *))
+{
+  SRefNode **nodeList;
+  SRefSet   *pSet;
+  int64_t   *lockedBy;
+  int        i, rsetId;
+
+  pthread_once(&tsRefModuleInit, taosInitRefModule);
+
+  nodeList = calloc(sizeof(SRefNode *), (size_t)max);
+  if (nodeList == NULL)  {
+    terrno = TSDB_CODE_REF_NO_MEMORY;
+    return -1;
+  }
+
+  lockedBy = calloc(sizeof(int64_t), (size_t)max);
+  if (lockedBy == NULL) {
+    free(nodeList);
+    terrno = TSDB_CODE_REF_NO_MEMORY;
+    return -1;
+  }
+
+  pthread_mutex_lock(&tsRefMutex);
+
+  for (i = 0; i < TSDB_REF_OBJECTS; ++i) {
+    tsNextId = (tsNextId + 1) % TSDB_REF_OBJECTS;
+    if (tsNextId == 0) tsNextId = 1;   // dont use 0 as rsetId
+    if (tsRefSetList[tsNextId].state == TSDB_REF_STATE_EMPTY) break;
+  }
+
+  if (i < TSDB_REF_OBJECTS) {
+    rsetId = tsNextId;
+    pSet = tsRefSetList + rsetId;
+    pSet->max = max;
+    pSet->nodeList = nodeList;
+    pSet->lockedBy = lockedBy;
+    pSet->fp = fp;
+    pSet->rid = 1;
+    pSet->rsetId = rsetId;
+    pSet->state = TSDB_REF_STATE_ACTIVE;
+    taosIncRsetCount(pSet);
+
+    tsRefSetNum++;
+    uTrace("rsetId:%d is opened, max:%d, fp:%p refSetNum:%d", rsetId, max, fp, tsRefSetNum);
+  } else {
+    rsetId = TSDB_CODE_REF_FULL;
+    free (nodeList);
+    free (lockedBy);
+    uTrace("run out of Ref ID, maximum:%d refSetNum:%d", TSDB_REF_OBJECTS, tsRefSetNum);
+  }
+
+  pthread_mutex_unlock(&tsRefMutex);
+
+  return rsetId;
+}
+
+------------------
+2022.12.13 - 2022.12.15
+vnodeMain.c#vnodeOpen
+
+
+
+
+
+------------
+2022.12.13 阅读walMgmt.c
+static void *walThreadFunc(void *param) {
+  while (1) {
+    walUpdateSeq();// 更新seq
+    walFsyncAll();// 同步all
+    if (tsWal.stop) break;
+  }
+
+  return NULL;
+}
+
+
+static void walUpdateSeq() {
+  taosMsleep(WAL_REFRESH_MS);
+  if (++tsWal.seq <= 0) {
+    tsWal.seq = 1;
+  }
+}
+
+
+static void walFsyncAll() {
+  SWal *pWal = taosIterateRef(tsWal.refId, 0);
+  while (pWal) {
+    if (walNeedFsync(pWal)) {// 到达checkpoint之后，将数据从wal日志文件同步到数据库文件
+      wTrace("vgId:%d, do fsync, level:%d seq:%d rseq:%d", pWal->vgId, pWal->level, pWal->fsyncSeq, tsWal.seq);
+      int32_t code = tfFsync(pWal->tfd);
+      if (code != 0) {
+        wError("vgId:%d, file:%s, failed to fsync since %s", pWal->vgId, pWal->name, strerror(code));
+      }
+    }
+    pWal = taosIterateRef(tsWal.refId, pWal->rid);
+  }
+}
+
+----------
+2022.12.22 阅读dnodeDispatch*代码
+
+dnodePeer.c#dnodeInitServer
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_CREATE_TABLE] = dnodeDispatchToVWriteQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_DROP_TABLE]   = dnodeDispatchToVWriteQueue; 
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_ALTER_TABLE]  = dnodeDispatchToVWriteQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_DROP_STABLE]  = dnodeDispatchToVWriteQueue;
+
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_CREATE_VNODE] = dnodeDispatchToVMgmtQueue; 
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_ALTER_VNODE]  = dnodeDispatchToVMgmtQueue; 
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_DROP_VNODE]   = dnodeDispatchToVMgmtQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_ALTER_STREAM] = dnodeDispatchToVMgmtQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_CONFIG_DNODE] = dnodeDispatchToVMgmtQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_MD_CREATE_MNODE] = dnodeDispatchToVMgmtQueue;
+
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_DM_CONFIG_TABLE] = dnodeDispatchToMPeerQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_DM_CONFIG_VNODE] = dnodeDispatchToMPeerQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_DM_AUTH]         = dnodeDispatchToMPeerQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_DM_GRANT]        = dnodeDispatchToMPeerQueue;
+  dnodeProcessReqMsgFp[TSDB_MSG_TYPE_DM_STATUS]       = dnodeDispatchToMPeerQueue;
+
+
+
+
+dnodeShell.c#dnodeInitShell
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_SUBMIT]         = dnodeDispatchToVWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_QUERY]          = dnodeDispatchToVReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_FETCH]          = dnodeDispatchToVReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_UPDATE_TAG_VAL] = dnodeDispatchToVWriteQueue;
+
+  // the following message shall be treated as mnode write
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_CREATE_ACCT] = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_ALTER_ACCT]  = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_DROP_ACCT]   = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_CREATE_USER] = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_ALTER_USER]  = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_DROP_USER]   = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_CREATE_DNODE]= dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_DROP_DNODE]  = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_CREATE_DB]   = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_DROP_DB]     = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_ALTER_DB]    = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_CREATE_TABLE]= dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_DROP_TABLE]  = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_ALTER_TABLE] = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_ALTER_STREAM]= dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_KILL_QUERY]  = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_KILL_STREAM] = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_KILL_CONN]   = dnodeDispatchToMWriteQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_CONFIG_DNODE]= dnodeDispatchToMWriteQueue;
+
+  // the following message shall be treated as mnode query
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_HEARTBEAT]   = dnodeDispatchToMReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_CONNECT]     = dnodeDispatchToMReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_USE_DB]      = dnodeDispatchToMReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_TABLE_META]  = dnodeDispatchToMReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_STABLE_VGROUP]= dnodeDispatchToMReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_TABLES_META] = dnodeDispatchToMReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_SHOW]        = dnodeDispatchToMReadQueue;
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_CM_RETRIEVE]    = dnodeDispatchToMReadQueue;
+
+  dnodeProcessShellMsgFp[TSDB_MSG_TYPE_NETWORK_TEST]   = dnodeSendStartupStep;
+
+
+Queue:
+VMgmtQueue           SWorker                   SWorkerPool
+VWriteQueue          SVWriteWorker             SVWriteWorkerPool
+VReadQueue           SWorker                   SWorkerPool(tsVQueryWP、tsVFetchWP)
+
+MPeerQueue           SMPeerWorker              SMPeerWorkerPool
+MWriteQueue          SMWriteWorker             SMWriteWorkerPool
+MReadQueue           SMReadWorker              SMReadWorkerPool
+
+tsSdbWQueue          SSdbWorker                SSdbWorkerPool
+
+tsVMWorkerQueue      SVMWorker                 SVMWorkerPool
+SCommitQueue         tsCommitQueue             tsCommitQueue
+tsHttpQueue          SHttpWorker               SHttpWorkerPool
+
+两大入口函数:
+dnodeProcessReqMsgFromDnode
+dnodeProcessShellMsgFp
+
+
+
+---------------
+2022.12.25 各部件的作用
+一、monde:
+write:
+1. mnodeDb.c
+mnodeProcessCreateDbMsg
+mnodeProcessAlterDbMsg
+mnodeProcessDropDbMsg
+
+2. mnodeDnode.c
+mnodeProcessCreateDnodeMsg
+mnodeProcessDropDnodeMsg
+mnodeProcessCfgDnodeMsg
+
+3. mnodeProfile.c
+mnodeProcessKillQueryMsg
+mnodeProcessKillStreamMsg
+mnodeProcessKillConnectionMsg
+
+4. mnodeTable.c
+mnodeProcessCreateTableMsg
+mnodeProcessDropTableMsg
+mnodeProcessAlterTableMsg
+
+5. mnodeUser.c
+mnodeProcessCreateUserMsg
+mnodeProcessAlterUserMsg
+mnodeProcessDropUserMsg
+
+read:
+1. mnodeShow.c
+mnodeProcessShowMsg
+mnodeProcessRetrieveMsg
+mnodeProcessHeartBeatMsg
+mnodeProcessConnectMsg
+mnodeProcessUseMsg
+
+2. mnodeTable.c
+mnodeProcessMultiTableMetaMsg
+mnodeProcessTableMetaMsg
+mnodeProcessSuperTableVgroupMsg
+
+peerMsg:
+1. mnodeTable.c
+mnodeProcessTableCfgMsg
+2. mnodeUser.c
+mnodeProcessAuthMsg
+3. mnodeVgroup.c
+mnodeProcessVnodeCfgMsg
+
+peerRsp:
+1. mnodeTable.c
+mnodeProcessCreateChildTableRsp
+mnodeProcessDropChildTableRsp
+mnodeProcessDropSuperTableRsp
+mnodeProcessAlterTableRsp
+
+2. mnodeVgroup.c
+mnodeProcessCreateVnodeRsp
+mnodeProcessAlterVnodeRsp
+mnodeProcessDropVnodeRsp
+
+二、vnode:
+read:
+1. vnodeRead.c
+vnodeProcessQueryMsg
+vnodeProcessFetchMsg
+
+write:
+1. vnodeWrite.c
+vnodeProcessSubmitMsg
+vnodeProcessCreateTableMsg
+vnodeProcessDropTableMsg
+vnodeProcessAlterTableMsg
+vnodeProcessDropStableMsg
+vnodeProcessUpdateTagValMsg
+
+
+------------
+2023.01.07-2023-01.08 继续各部件的作用，标注pthread_once、pthread_create函数
+bnMain.c
+qTokenizer.c
+syncMain.c
+
+------------
+2023.01-09 各模块属于什么架构中什么部件，有什么功能，怎么实现的
+balance: 平衡               mnode                  监控集群Mnode的数量、vgReplica的数量、dnode的balance                     创建pthread用以执行bnThreadFunc()，函数中while(1)执行bnStart()            线程bnThread、timer
+client: 客户端              client
+common: 共用的
+connector: 连接器           对应语言的client
+cq: stream                  vnode                  vnodeMain:cqOpen(打开cq计算节点)、cqCreate{准备pContext及pObj、创建stream(1. 如果没有创建，每隔一秒执行cqProcessCreateTimer函数 2.taos_open_stream)}
+dnode: 物理结点             dnode
+    dnodeCfg.c              读取/dnodeCfg.json配置文件,(cJSON),读取整个json结构体到root，读取并设置dnodeId，读取并设置clusterId。
+    dnodeCheck.c            创建check项(dnodeAllocCheckItem)，检查以下项:参数、环境(Network、Mem、Cpu、Disk、Os、Access、Version、Datafile)
+	dnodeEps.c              
+	dnodeMInfos.c
+	dnodeModule.c
+	dnodeMPeer.c
+	
+	
+	
+inc: 共用的c语言头文件
+kit: 
+   shell: 脚本              cmd shell
+   taosdemo:
+   taosdump: dump data      dump.sh
+mnode: mnode模块            mnode
+os: 对不同系统做兼容
+plugins: 插件
+   http:
+   monitor:                 dnode
+   mqtt:
+query: 查询                 vnode
+rpc: rpc调用                dnode/client
+sync: 同步                  vnode
+tfs: 文件系统               dnode
+tsdb: database              vnode
+util: 工具
+vnode: vnode数据结点        vnode
+wal: write ahead log        dnode/vnode
+
+
+线程: 
+主线程：
+后台线程：
